@@ -1,7 +1,10 @@
 import os
 import json
-from flask import Flask,session,url_for,redirect
+from flask import Flask,session,url_for,redirect,jsonify,request
 from flask_oidc import OpenIDConnect
+from authlib.oauth2.rfc7662 import (
+    IntrospectTokenValidator as BaseIntrospectTokenValidator,
+)
 
 def create_app(test_config=None):
     # create and configure the app
@@ -45,21 +48,16 @@ def create_app(test_config=None):
 def create_app_oauth(test_config=None):
 
     from authlib.integrations.flask_client import OAuth
+    from authlib.integrations.flask_oauth2 import ResourceProtector
     from dotenv import load_dotenv
-    import base64
-    import re
-    import hashlib
 
     load_dotenv()
 
+    def update_token(name, token, refresh_token=None, access_token=None):
+        session["token"] = token
+
     # create and configure the app
     app = Flask(__name__, instance_relative_config=True)
-
-    code_verifier = base64.urlsafe_b64encode(os.urandom(40)).decode('utf-8')
-    code_verifier = re.sub('[^a-zA-Z0-9]+', '', code_verifier)
-    code_challenge = hashlib.sha256(code_verifier.encode('utf-8')).digest()
-    code_challenge = base64.urlsafe_b64encode(code_challenge).decode('utf-8')
-    code_challenge = code_challenge.replace('=', '')
 
     app.config.update(
         SECRET_KEY='flask-keycloak-oidc',
@@ -73,9 +71,33 @@ def create_app_oauth(test_config=None):
         name='keycloak',
         server_metadata_url=os.environ["KEYCLOAK_SERVER_METADATA_URL"],
         client_kwargs={
-            'scope': 'openid'
-        }
+            'scope': 'openid',
+            'code_challenge_method': 'S256'
+        },
+        update_token=update_token
     )
+
+    require_oauth = ResourceProtector()
+
+    class IntrospectTokenValidator(BaseIntrospectTokenValidator):
+        """Validates a token using introspection."""
+
+        def introspect_token(self, token_string):
+            """Return the token introspection result."""
+            #oauth = g._oidc_auth
+            metadata = oauth.keycloak.load_server_metadata()
+            if "introspection_endpoint" not in metadata:
+                raise RuntimeError(
+                    "Can't validate the token because the server does not support "
+                    "introspection."
+                )
+            with oauth.keycloak._get_oauth_client(**metadata) as session:
+                response = session.introspect_token(
+                    metadata["introspection_endpoint"], token=token_string
+                )
+            return response.json()
+
+    require_oauth.register_token_validator(IntrospectTokenValidator())
 
     @app.route('/')
     def homepage():
@@ -89,16 +111,31 @@ def create_app_oauth(test_config=None):
     @app.route('/login')
     def login():
         redirect_uri = url_for('authorize', _external=True)
-        return oauth.keycloak.authorize_redirect(redirect_uri, code_challenge=code_challenge, code_challenge_method="S256")
+        return oauth.keycloak.authorize_redirect(redirect_uri)
+    
+    # @app.before_request
+    # def add_access_token():
+    #     if session.get('access_token'):
+    #         request.headers['Authorization'] = 'Bearer ' + session.get('access_token')
 
     @app.route('/authorize')
     def authorize():
-        token = oauth.keycloak.authorize_access_token(code_verifier=code_verifier)
+        token = oauth.keycloak.authorize_access_token()
         session['user'] = token['userinfo']
+        session['access_token'] = token['access_token']
         return redirect('/')
+    
+    @app.route('/uebersicht')
+    @require_oauth(scopes=['email'])
+    def uebersicht():
+        return "Uebersicht"
+
+    @app.route('/testendpoint')
+    @require_oauth(scopes=['email'])
+    def testendpoint():
+        return jsonify("Test-Endpoint")
 
     return app
-    
 
 if __name__ == '__main__':
     app = create_app_oauth()
